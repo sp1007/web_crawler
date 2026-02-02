@@ -18,17 +18,18 @@ class ProxyManager:
     
     # Các nguồn proxy miễn phí
     PROXY_SOURCES = [
-        #"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
-        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=1",
-        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=2",
-        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=3",
-        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=4",
+        "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
+        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=1",
+        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=2",
+        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=3",
+        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=4",
         
-        # "https://proxydb.net/?anonlvl=4&country=CN&offset=0",
-        # "https://proxydb.net/?anonlvl=4&country=CN&offset=30",
-        # "https://proxydb.net/?anonlvl=4&country=CN&offset=60",
-        # "https://proxydb.net/?anonlvl=4&country=CN&offset=90",
-        "https://databay.com/free-proxy-list/china",
+        "https://proxydb.net/?anonlvl=4&country=CN&offset=0",
+        "https://proxydb.net/?anonlvl=4&country=CN&offset=30",
+        "https://proxydb.net/?anonlvl=4&country=CN&offset=60",
+        "https://proxydb.net/?anonlvl=4&country=CN&offset=90",
+        "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
+        "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
     ]
     
     def __init__(self, custom_sources: Optional[List[str]] = None):
@@ -71,7 +72,6 @@ class ProxyManager:
     def _parse_proxy_list(self, content: str, source: str) -> List[str]:
         """Parse danh sách proxy từ response"""
         proxies = []
-        
         # Nếu là plain text (mỗi dòng 1 proxy)
         if "api.proxyscrape.com" in source:
             lines = content.strip().split('\n')
@@ -79,6 +79,15 @@ class ProxyManager:
                 line = line.strip()
                 if line and '://' in line:
                     proxies.append(line)
+        elif "cdn.jsdelivr.net/gh/databay-labs" in source:
+            lines = content.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if line and ':' in line:
+                    if 'socks5' in source:
+                        proxies.append(f"socks5://{line}")
+                    else:
+                        proxies.append(f"http://{line}")
         elif "www.freeproxy.world" in source:
             proxies.extend(self._parse_freeproxy_world(content))
         elif "proxydb.net" in source:
