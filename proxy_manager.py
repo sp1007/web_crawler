@@ -19,12 +19,15 @@ class ProxyManager:
     # Các nguồn proxy miễn phí
     PROXY_SOURCES = [
         #"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
-        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=1",
-        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=2",
-        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=3",
-        "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=4",
+        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=1",
+        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=2",
+        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=3",
+        # "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=4",
         
-        "https://proxydb.net/?anonlvl=4&country=CN&offset=0",
+        # "https://proxydb.net/?anonlvl=4&country=CN&offset=0",
+        # "https://proxydb.net/?anonlvl=4&country=CN&offset=30",
+        # "https://proxydb.net/?anonlvl=4&country=CN&offset=60",
+        # "https://proxydb.net/?anonlvl=4&country=CN&offset=90",
         "https://databay.com/free-proxy-list/china",
     ]
     
@@ -78,6 +81,8 @@ class ProxyManager:
                     proxies.append(line)
         elif "www.freeproxy.world" in source:
             proxies.extend(self._parse_freeproxy_world(content))
+        elif "proxydb.net" in source:
+            proxies.extend(self.parse_proxydb_net(content))
         else:
             # Thử parse HTML
             try:
@@ -117,6 +122,25 @@ class ProxyManager:
                                 proxies.append(proxy)
         except Exception as e:
             logger.warning(f"Failed to parse freeproxy.world: {e}")
+        return proxies
+    
+    def parse_proxydb_net(self, content: str) -> List[str]:
+        """Cách parse riêng cho proxydb.net nếu cần"""
+        proxies = []
+        try:
+            soup = BeautifulSoup(content, 'html.parser')
+            info_containers = soup.select('div.table-responsive tbody tr')
+            if info_containers and len(info_containers) > 0:
+                for row in info_containers:
+                    cols = row.select('td')
+                    if len(cols) >= 9:
+                        ip = cols[0].get_text(strip=True)
+                        port = cols[1].select_one('a').get_text(strip=True)
+                        protocol = cols[2].get_text(strip=True).lower()
+                        proxy = f"{protocol}://{ip}:{port}"
+                        proxies.append(proxy)
+        except Exception as e:
+            logger.warning(f"Failed to parse proxydb.net: {e}")
         return proxies
     
     async def get_proxy(self) -> Optional[str]:
