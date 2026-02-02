@@ -23,6 +23,9 @@ class ProxyManager:
         "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=2",
         "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=3",
         "https://www.freeproxy.world/?type=&anonymity=&country=CN&page=4",
+        
+        "https://proxydb.net/?anonlvl=4&country=CN&offset=0",
+        "https://databay.com/free-proxy-list/china",
     ]
     
     def __init__(self, custom_sources: Optional[List[str]] = None):
