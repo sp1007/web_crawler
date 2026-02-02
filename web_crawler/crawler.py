@@ -107,7 +107,7 @@ class WebCrawler:
             for attempt in range(self.max_retries):
                 proxy = None
                 if self.use_proxy and self.proxy_manager:
-                    proxy = self.proxy_manager.get_proxy()
+                    proxy = await self.proxy_manager.get_proxy()
                 
                 try:
                     if proxy and proxy.startswith("socks"):
@@ -207,6 +207,10 @@ class WebCrawler:
                 )
             else:
                 await asyncio.gather(*tasks)
+
+    async def _run(self):
+        await self._crawl_async()
+        await self.storage.finalize()
     
     def crawl(self) -> dict:
         """
@@ -219,11 +223,12 @@ class WebCrawler:
         
         self.stats['start_time'] = time.time()
         
-        # Run async crawl
-        asyncio.run(self._crawl_async())
+        # # Run async crawl
+        # asyncio.run(self._crawl_async())
         
-        # Finalize storage
-        asyncio.run(self.storage.finalize())
+        # # Finalize storage
+        # asyncio.run(self.storage.finalize())
+        asyncio.run(self._run())
         
         self.stats['end_time'] = time.time()
         self.stats['duration'] = round(self.stats['end_time'] - self.stats['start_time'], 2)
