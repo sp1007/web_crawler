@@ -1,297 +1,439 @@
 """
-Chain Crawler - Crawl theo chuỗi (multi-step crawling)
-Ví dụ: URL1 → URL2 → URL3 → Kết quả cuối cùng
+ChainCrawler - multi-step crawling (URL list -> URL list -> ... -> final results).
 """
 
-import aiohttp
+from __future__ import annotations
+
 import asyncio
-from typing import List, Callable, Optional, Any, Dict
-from bs4 import BeautifulSoup
+import inspect
 import logging
+import random
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Optional
+
+import aiohttp
 from tqdm import tqdm
 
+from .http_client import SocksSessionPool, build_headers, is_socks_proxy
 from .proxy_manager import ProxyManager
-from .storage import StorageBackend, AggregatedStorage
+from .storage import AggregatedStorage, StorageBackend
 
 logger = logging.getLogger(__name__)
 
 
 class ChainStep:
-    """Định nghĩa một bước trong chain"""
-    
+    """
+    One step in the chain.
+
+    - parser(url, html) -> data
+    - extract_next_urls(data) -> list[str] (optional; if omitted this is the final step)
+    """
+
     def __init__(
         self,
         name: str,
         parser: Callable[[str, str], Any],
-        extract_next_urls: Optional[Callable[[Any], List[str]]] = None
-    ):
-        """
-        Args:
-            name: Tên của step
-            parser: Hàm parse HTML: (url, html) -> data
-            extract_next_urls: Hàm extract URLs cho step tiếp theo: (data) -> List[url]
-                              Nếu None, đây là step cuối cùng
-        """
+        extract_next_urls: Optional[Callable[[Any], list[str]]] = None,
+    ) -> None:
         self.name = name
         self.parser = parser
         self.extract_next_urls = extract_next_urls
-        
+
     def is_final_step(self) -> bool:
-        """Check xem có phải step cuối cùng không"""
         return self.extract_next_urls is None
+
+
+@dataclass
+class _WorkerResult:
+    next_urls: list[str]
+    processed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    next_urls_found: int = 0
+    final_saved: int = 0
 
 
 class ChainCrawler:
     """
-    Crawler cho multi-step crawling
-    
-    Example:
-        Step 1: Load category page → extract product URLs
-        Step 2: Load product pages → extract detail URLs  
-        Step 3: Load detail pages → extract final data
+    Multi-step crawler.
+
+    Each step processes a list of URLs and may produce the next list of URLs.
+    Only final-step results are persisted to storage.
     """
-    
+
     def __init__(
         self,
-        initial_urls: List[str],
-        steps: List[ChainStep],
+        initial_urls: list[str],
+        steps: list[ChainStep],
         storage: Optional[StorageBackend] = None,
         max_workers: int = 8,
         use_proxy: bool = True,
-        proxy_sources: Optional[List[str]] = None,
+        proxy_sources: Optional[list[str]] = None,
         timeout: int = 30,
         max_retries: int = 3,
         retry_delay: int = 2,
         max_urls_per_step: Optional[int] = None,
-        show_progress: bool = True
-    ):
-        """
-        Args:
-            initial_urls: URLs bắt đầu (step 1)
-            steps: List các ChainStep
-            storage: Storage backend (chỉ lưu kết quả cuối cùng)
-            max_workers: Concurrent workers
-            use_proxy: Sử dụng proxy
-            proxy_sources: Custom proxy sources
-            timeout: Request timeout
-            max_retries: Số lần retry
-            retry_delay: Delay giữa retries
-            max_urls_per_step: Giới hạn số URLs mỗi step (None = không giới hạn)
-            show_progress: Hiển thị progress bar (mặc định: True)
-        """
-        self.initial_urls = initial_urls
-        self.steps = steps
+        show_progress: bool = True,
+        force_refresh_proxies: bool = False,
+        validate_proxies: bool = True,
+        auto_export_proxies: bool = False,
+        export_proxies_file: str = "working_proxies.txt",
+        headers: Optional[dict[str, str]] = None,
+        user_agent: Optional[str] = None,
+        follow_redirects: bool = True,
+        max_redirects: int = 10,
+        verify_ssl: bool = True,
+        limit_per_host: int = 5,
+        parser_in_thread: bool = False,
+        retry_backoff: float = 2.0,
+        retry_jitter: float = 0.1,
+        retry_on_statuses: Optional[Iterable[int]] = None,
+        proxy_test_url: str = "http://httpbin.org/ip",
+        proxy_test_timeout: int = 10,
+        proxy_test_max_concurrent: int = 20,
+        max_socks_sessions: int = 20,
+    ) -> None:
+        self.initial_urls = list(initial_urls)
+        self.steps = list(steps)
         self.storage = storage or AggregatedStorage()
-        self.max_workers = max_workers
-        self.use_proxy = use_proxy
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
+
+        self.max_workers = max(1, int(max_workers))
+        self.use_proxy = bool(use_proxy)
+        self.timeout = int(timeout)
+        self.max_retries = max(1, int(max_retries))
+        self.retry_delay = float(retry_delay)
         self.max_urls_per_step = max_urls_per_step
-        self.show_progress = show_progress
-        
-        self.proxy_manager = ProxyManager(custom_sources=proxy_sources) if use_proxy else None
-        
-        # Statistics
-        self.stats = {
-            'total_requests': 0,
-            'successful_requests': 0,
-            'failed_requests': 0,
-            'steps_completed': 0,
-            'final_results': 0,
-            'step_stats': {}
+        self.show_progress = bool(show_progress)
+
+        self.force_refresh_proxies = bool(force_refresh_proxies)
+        self.validate_proxies = bool(validate_proxies)
+        self.auto_export_proxies = bool(auto_export_proxies)
+        self.export_proxies_file = export_proxies_file
+
+        self.follow_redirects = bool(follow_redirects)
+        self.max_redirects = int(max_redirects)
+        self.verify_ssl = bool(verify_ssl)
+        self.limit_per_host = int(limit_per_host)
+        self.parser_in_thread = bool(parser_in_thread)
+
+        self.retry_backoff = float(retry_backoff)
+        self.retry_jitter = float(retry_jitter)
+        self.retry_on_statuses = set(retry_on_statuses) if retry_on_statuses else {429, 500, 502, 503, 504}
+
+        self.proxy_test_url = proxy_test_url
+        self.proxy_test_timeout = int(proxy_test_timeout)
+        self.proxy_test_max_concurrent = int(proxy_test_max_concurrent)
+
+        self.headers = build_headers(headers, user_agent=user_agent)
+        self._timeout = aiohttp.ClientTimeout(total=self.timeout)
+        self._ssl = None if self.verify_ssl else False
+
+        self.proxy_manager = (
+            ProxyManager(custom_sources=proxy_sources, headers=self.headers, verify_ssl=self.verify_ssl)
+            if self.use_proxy
+            else None
+        )
+
+        self._socks_pool = SocksSessionPool(
+            max_sessions=max_socks_sessions,
+            timeout=self._timeout,
+            headers=self.headers,
+            connector_kwargs={"limit": self.max_workers, "limit_per_host": self.limit_per_host},
+        )
+        self._cache_socks_sessions = max_socks_sessions != 0
+
+        self.stats: dict[str, Any] = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "steps_completed": 0,
+            "final_results": 0,
+            "step_stats": {},
         }
-        
-    async def _fetch_url(
+
+    def _retry_sleep_seconds(self, attempt: int) -> float:
+        base = float(self.retry_delay) * (float(self.retry_backoff) ** attempt)
+        if self.retry_jitter <= 0:
+            return base
+        return base + random.uniform(0.0, float(self.retry_jitter) * base)
+
+    async def _handle_bad_status(
         self,
-        session: aiohttp.ClientSession,
         url: str,
-        semaphore: asyncio.Semaphore
-    ) -> tuple[str, Optional[str]]:
-        """Fetch một URL với retry"""
-        async with semaphore:
-            for attempt in range(self.max_retries):
-                proxy = None
-                if self.use_proxy and self.proxy_manager:
-                    proxy = await self.proxy_manager.get_proxy()
-                
+        status: int,
+        response: aiohttp.ClientResponse,
+        proxy: Optional[str],
+        attempt: int,
+    ) -> None:
+        if proxy and self.proxy_manager and status in {407, 502, 503, 504}:
+            self.proxy_manager.mark_failed(proxy)
+            if is_socks_proxy(proxy):
+                await self._socks_pool.invalidate(proxy)
+
+        if status in self.retry_on_statuses and attempt < self.max_retries - 1:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
                 try:
+                    seconds = max(0.0, float(retry_after))
+                except ValueError:
+                    seconds = 0.0
+                if seconds > 0:
+                    await asyncio.sleep(seconds)
+                    return
+
+        logger.debug("HTTP %s for %s (proxy=%s)", status, url, proxy)
+
+    async def _fetch_url(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
+        for attempt in range(self.max_retries):
+            proxy: Optional[str] = None
+            if self.use_proxy and self.proxy_manager:
+                proxy = await self.proxy_manager.get_proxy()
+
+            try:
+                if proxy and is_socks_proxy(proxy):
+                    socks_session = await self._socks_pool.get(proxy)
+                    try:
+                        async with socks_session.get(
+                            url,
+                            ssl=self._ssl,
+                            allow_redirects=self.follow_redirects,
+                            max_redirects=self.max_redirects,
+                        ) as response:
+                            if response.status == 200:
+                                return await response.text(errors="ignore")
+                            await self._handle_bad_status(url, response.status, response, proxy, attempt)
+                    finally:
+                        if not self._cache_socks_sessions:
+                            await socks_session.close()
+                else:
                     async with session.get(
                         url,
                         proxy=proxy,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                        ssl=False
+                        ssl=self._ssl,
+                        allow_redirects=self.follow_redirects,
+                        max_redirects=self.max_redirects,
                     ) as response:
                         if response.status == 200:
-                            html = await response.text()
-                            logger.debug(f"✓ Fetched: {url}")
-                            return url, html
-                        else:
-                            logger.warning(f"HTTP {response.status} for {url}")
-                            
-                except Exception as e:
-                    logger.debug(f"Attempt {attempt + 1}/{self.max_retries} failed for {url}: {e}")
-                    
-                    if proxy and self.proxy_manager:
-                        self.proxy_manager.mark_failed(proxy)
-                    
-                    if attempt < self.max_retries - 1:
-                        await asyncio.sleep(self.retry_delay)
-            
-            logger.warning(f"✗ Failed to fetch: {url}")
-            return url, None
-    
+                            return await response.text(errors="ignore")
+                        await self._handle_bad_status(url, response.status, response, proxy, attempt)
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.debug("Attempt %s/%s failed for %s: %s", attempt + 1, self.max_retries, url, e)
+                if proxy and self.proxy_manager:
+                    self.proxy_manager.mark_failed(proxy)
+                if proxy and is_socks_proxy(proxy):
+                    await self._socks_pool.invalidate(proxy)
+
+            if attempt < self.max_retries - 1:
+                await asyncio.sleep(self._retry_sleep_seconds(attempt))
+
+        return None
+
+    async def _maybe_prepare_proxies(self) -> None:
+        if not (self.use_proxy and self.proxy_manager):
+            return
+
+        if self.force_refresh_proxies or not self.proxy_manager.proxies:
+            await self.proxy_manager.fetch_proxies()
+
+        if self.validate_proxies and self.proxy_manager.proxies:
+            results = await self.proxy_manager.test_all_proxies(
+                test_url=self.proxy_test_url,
+                timeout=self.proxy_test_timeout,
+                max_concurrent=self.proxy_test_max_concurrent,
+                show_progress=self.show_progress,
+                remove_failed=True,
+            )
+
+            if self.auto_export_proxies:
+                self.proxy_manager.export_live_proxies(self.export_proxies_file)
+                logger.info("Auto-exported working proxies to %s", self.export_proxies_file)
+
+            logger.info(
+                "Proxy validation: working=%s/%s (success_rate=%.1f%%)",
+                results["working"],
+                results["total"],
+                results["success_rate"] * 100.0,
+            )
+
+        if not self.proxy_manager.proxies:
+            logger.warning("No proxies available; continuing without proxy.")
+            self.use_proxy = False
+
     async def _process_step(
         self,
         session: aiohttp.ClientSession,
         step: ChainStep,
-        urls: List[str],
-        semaphore: asyncio.Semaphore,
-        step_index: int
-    ) -> List[str]:
-        """
-        Process một step
-        
-        Returns:
-            List URLs cho step tiếp theo (hoặc empty nếu là final step)
-        """
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Step {step_index + 1}/{len(self.steps)}: {step.name}")
-        logger.info(f"Processing {len(urls)} URLs...")
-        logger.info(f"{'='*60}")
-        
-        # Giới hạn URLs nếu cần
-        if self.max_urls_per_step and len(urls) > self.max_urls_per_step:
-            logger.warning(f"Limiting URLs from {len(urls)} to {self.max_urls_per_step}")
-            urls = urls[:self.max_urls_per_step]
-        
-        # Stats cho step này
+        urls: list[str],
+        step_index: int,
+    ) -> list[str]:
+        if self.max_urls_per_step is not None and len(urls) > self.max_urls_per_step:
+            logger.warning("Limiting step %s URLs from %s to %s", step_index + 1, len(urls), self.max_urls_per_step)
+            urls = urls[: self.max_urls_per_step]
+
+        if not urls:
+            return []
+
+        worker_count = min(self.max_workers, len(urls))
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        for url in urls:
+            queue.put_nowait(url)
+        for _ in range(worker_count):
+            queue.put_nowait(None)
+
+        pbar = (
+            tqdm(total=len(urls), desc=f"Step {step_index + 1}: {step.name}", unit="url")
+            if self.show_progress
+            else None
+        )
+
+        async def worker() -> _WorkerResult:
+            result = _WorkerResult(next_urls=[])
+            while True:
+                url = await queue.get()
+                try:
+                    if url is None:
+                        return result
+
+                    result.processed += 1
+                    self.stats["total_requests"] += 1
+
+                    html = await self._fetch_url(session, url)
+                    if not html:
+                        result.failed += 1
+                        self.stats["failed_requests"] += 1
+                        continue
+
+                    try:
+                        if self.parser_in_thread and not inspect.iscoroutinefunction(step.parser):
+                            data = await asyncio.to_thread(step.parser, url, html)
+                        else:
+                            data = step.parser(url, html)
+                            if inspect.isawaitable(data):
+                                data = await data
+
+                        if step.is_final_step():
+                            await self.storage.save(url, data)
+                            result.final_saved += 1
+                            self.stats["final_results"] += 1
+                        else:
+                            new_urls = step.extract_next_urls(data) if step.extract_next_urls else []
+                            if new_urls:
+                                result.next_urls.extend(new_urls)
+                                result.next_urls_found += len(new_urls)
+
+                        result.succeeded += 1
+                        self.stats["successful_requests"] += 1
+                    except Exception as e:
+                        logger.exception("Error processing %s in step '%s': %s", url, step.name, e)
+                        result.failed += 1
+                        self.stats["failed_requests"] += 1
+                finally:
+                    queue.task_done()
+                    if pbar is not None and url is not None:
+                        pbar.update(1)
+
+        try:
+            tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
+            await queue.join()
+            results = await asyncio.gather(*tasks)
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        # Merge worker results.
+        next_urls: list[str] = []
         step_stats = {
-            'urls_processed': 0,
-            'urls_succeeded': 0,
-            'urls_failed': 0,
-            'next_urls_found': 0
+            "urls_processed": 0,
+            "urls_succeeded": 0,
+            "urls_failed": 0,
+            "next_urls_found": 0,
+            "final_saved": 0,
         }
-        
-        next_urls = []
-        
-        # Fetch và parse tất cả URLs trong step này
-        urls_iter = tqdm(urls, desc=f"Step {step_index + 1}: {step.name}", unit="url") if self.show_progress else urls
-        
-        for url in urls_iter:
-            self.stats['total_requests'] += 1
-            step_stats['urls_processed'] += 1
-            
-            # Fetch URL
-            _, html = await self._fetch_url(session, url, semaphore)
-            
-            if not html:
-                self.stats['failed_requests'] += 1
-                step_stats['urls_failed'] += 1
-                continue
-            
-            self.stats['successful_requests'] += 1
-            step_stats['urls_succeeded'] += 1
-            
-            try:
-                # Parse HTML
-                data = step.parser(url, html)
-                
-                # Nếu là final step, lưu kết quả
-                if step.is_final_step():
-                    await self.storage.save(url, data)
-                    self.stats['final_results'] += 1
-                    logger.info(f"  ✓ Saved final result from: {url}")
-                else:
-                    # Extract URLs cho step tiếp theo
-                    new_urls = step.extract_next_urls(data)
-                    if new_urls:
-                        next_urls.extend(new_urls)
-                        step_stats['next_urls_found'] += len(new_urls)
-                        logger.info(f"  ✓ Found {len(new_urls)} URLs from: {url}")
-                    
-            except Exception as e:
-                logger.error(f"  ✗ Error processing {url}: {e}")
-                step_stats['urls_failed'] += 1
-        
-        # Lưu stats
-        self.stats['step_stats'][step.name] = step_stats
-        self.stats['steps_completed'] += 1
-        
-        # Log step summary
-        logger.info(f"\nStep {step_index + 1} Summary:")
-        logger.info(f"  Processed: {step_stats['urls_processed']}")
-        logger.info(f"  Succeeded: {step_stats['urls_succeeded']}")
-        logger.info(f"  Failed: {step_stats['urls_failed']}")
-        if not step.is_final_step():
-            logger.info(f"  Next URLs: {step_stats['next_urls_found']}")
-        
-        # Remove duplicates
+        for r in results:
+            step_stats["urls_processed"] += r.processed
+            step_stats["urls_succeeded"] += r.succeeded
+            step_stats["urls_failed"] += r.failed
+            step_stats["next_urls_found"] += r.next_urls_found
+            step_stats["final_saved"] += r.final_saved
+            if r.next_urls:
+                next_urls.extend(r.next_urls)
+
+        # De-duplicate for the next step.
         if next_urls:
-            next_urls = list(set(next_urls))
-            logger.info(f"  Unique next URLs: {len(next_urls)}")
-        
+            next_urls = list(dict.fromkeys(next_urls))
+
+        self.stats["step_stats"][step.name] = step_stats
+        self.stats["steps_completed"] += 1
+
+        logger.info(
+            "Step %s/%s '%s': processed=%s ok=%s failed=%s next_urls=%s",
+            step_index + 1,
+            len(self.steps),
+            step.name,
+            step_stats["urls_processed"],
+            step_stats["urls_succeeded"],
+            step_stats["urls_failed"],
+            step_stats["next_urls_found"],
+        )
+
         return next_urls
-    
+
     async def _crawl_async(self) -> None:
-        """Main async crawl logic"""
-        # Fetch proxies nếu cần
-        if self.use_proxy and self.proxy_manager:
-            await self.proxy_manager.fetch_proxies()
-            if not self.proxy_manager.proxies:
-                logger.warning("No proxies available, continuing without proxy...")
-                self.use_proxy = False
-        
-        # Semaphore để limit concurrent requests
-        semaphore = asyncio.Semaphore(self.max_workers)
-        
-        # Connector
-        connector = aiohttp.TCPConnector(limit=self.max_workers, limit_per_host=5)
-        
-        async with aiohttp.ClientSession(connector=connector) as session:
-            current_urls = self.initial_urls
-            
-            # Process từng step
+        if not self.steps:
+            logger.warning("No steps configured.")
+            return
+
+        await self._maybe_prepare_proxies()
+
+        connector = aiohttp.TCPConnector(limit=self.max_workers, limit_per_host=self.limit_per_host)
+        async with aiohttp.ClientSession(connector=connector, timeout=self._timeout, headers=self.headers) as session:
+            current_urls = list(self.initial_urls)
+
             for step_index, step in enumerate(self.steps):
                 if not current_urls:
-                    logger.warning(f"No URLs to process for step {step_index + 1}. Stopping.")
+                    logger.warning("No URLs to process for step %s. Stopping.", step_index + 1)
                     break
-                
-                # Process step
-                current_urls = await self._process_step(
-                    session, step, current_urls, semaphore, step_index
-                )
-                
-                # Nếu là final step, không cần tiếp tục
+
+                current_urls = await self._process_step(session, step, current_urls, step_index)
                 if step.is_final_step():
                     break
-    
-    def crawl(self) -> Dict[str, Any]:
-        """
-        Bắt đầu chain crawl
-        
-        Returns:
-            Dict chứa statistics
-        """
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Starting Chain Crawl")
-        logger.info(f"  Initial URLs: {len(self.initial_urls)}")
-        logger.info(f"  Steps: {len(self.steps)}")
-        logger.info(f"  Workers: {self.max_workers}")
-        logger.info(f"{'='*80}")
-        
-        # Run async crawl
-        asyncio.run(self._crawl_async())
-        
-        # Finalize storage
-        asyncio.run(self.storage.finalize())
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Chain Crawl Completed")
-        logger.info(f"  Total Requests: {self.stats['total_requests']}")
-        logger.info(f"  Successful: {self.stats['successful_requests']}")
-        logger.info(f"  Failed: {self.stats['failed_requests']}")
-        logger.info(f"  Final Results: {self.stats['final_results']}")
-        logger.info(f"{'='*80}")
-        
+
+    async def crawl_async(self) -> dict[str, Any]:
+        self.stats = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "steps_completed": 0,
+            "final_results": 0,
+            "step_stats": {},
+        }
+
+        logger.info(
+            "Starting Chain Crawl: initial_urls=%s steps=%s workers=%s",
+            len(self.initial_urls),
+            len(self.steps),
+            self.max_workers,
+        )
+
+        try:
+            await self._crawl_async()
+            await self.storage.finalize()
+        finally:
+            await self._socks_pool.close()
+
+        logger.info(
+            "Chain Crawl Completed: total=%s ok=%s failed=%s final=%s",
+            self.stats["total_requests"],
+            self.stats["successful_requests"],
+            self.stats["failed_requests"],
+            self.stats["final_results"],
+        )
         return self.stats
+
+    def crawl(self) -> dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.crawl_async())
+        raise RuntimeError("ChainCrawler.crawl() cannot run inside an existing event loop. Use await crawl_async().")

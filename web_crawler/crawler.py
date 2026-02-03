@@ -1,36 +1,44 @@
 """
-Web Crawler - Main crawler class với async và proxy support
+WebCrawler - Async web crawler with optional proxy rotation.
 """
 
-import aiohttp
-from aiohttp_socks import ProxyConnector
-import asyncio
-from typing import List, Callable, Optional, Any
-from bs4 import BeautifulSoup
-import logging
-from concurrent.futures import ThreadPoolExecutor
-import time
-from tqdm.asyncio import tqdm as async_tqdm
+from __future__ import annotations
 
+import asyncio
+import inspect
+import logging
+import random
+import time
+from typing import Any, Callable, Iterable, Optional
+
+import aiohttp
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+
+from .http_client import SocksSessionPool, build_headers, is_socks_proxy
 from .proxy_manager import ProxyManager
-from .storage import StorageBackend, AggregatedStorage
+from .storage import AggregatedStorage, StorageBackend
 
 logger = logging.getLogger(__name__)
 
 
 class WebCrawler:
     """
-    Async Web Crawler với proxy rotation và customizable parser
+    Async web crawler with:
+    - configurable concurrency
+    - retry with exponential backoff (+ jitter)
+    - optional proxy rotation (HTTP + SOCKS)
+    - pluggable storage backends
     """
-    
+
     def __init__(
         self,
-        urls: List[str],
+        urls: list[str],
         parser: Optional[Callable[[str, str], Any]] = None,
         storage: Optional[StorageBackend] = None,
         max_workers: int = 8,
         use_proxy: bool = True,
-        proxy_sources: Optional[List[str]] = None,
+        proxy_sources: Optional[list[str]] = None,
         timeout: int = 30,
         max_retries: int = 3,
         retry_delay: int = 2,
@@ -38,239 +46,316 @@ class WebCrawler:
         force_refresh_proxies: bool = False,
         validate_proxies: bool = True,
         auto_export_proxies: bool = False,
-        export_proxies_file: str = "working_proxies.txt"
-    ):
-        """
-        Args:
-            urls: Danh sách URLs cần crawl
-            parser: Hàm custom để parse HTML (url, html_content) -> data
-            storage: Storage backend (mặc định: AggregatedStorage)
-            max_workers: Số lượng concurrent workers (mặc định: 8)
-            use_proxy: Sử dụng proxy hay không
-            proxy_sources: Custom proxy sources
-            timeout: Timeout cho mỗi request (seconds)
-            max_retries: Số lần retry khi thất bại
-            retry_delay: Delay giữa các retry (seconds)
-            show_progress: Hiển thị progress bar (mặc định: True)
-            force_refresh_proxies: Bắt buộc tải lại proxy từ nguồn online
-            validate_proxies: Kiểm tra proxy trước khi sử dụng
-            auto_export_proxies: Tự động xuất proxy hoạt động sau khi kiểm tra
-            export_proxies_file: File để xuất proxy hoạt động
-        """
-        self.urls = urls
+        export_proxies_file: str = "working_proxies.txt",
+        headers: Optional[dict[str, str]] = None,
+        user_agent: Optional[str] = None,
+        follow_redirects: bool = True,
+        max_redirects: int = 10,
+        verify_ssl: bool = True,
+        limit_per_host: int = 5,
+        parser_in_thread: bool = False,
+        retry_backoff: float = 2.0,
+        retry_jitter: float = 0.1,
+        retry_on_statuses: Optional[Iterable[int]] = None,
+        proxy_test_url: str = "http://httpbin.org/ip",
+        proxy_test_timeout: int = 10,
+        proxy_test_max_concurrent: int = 20,
+        max_socks_sessions: int = 20,
+    ) -> None:
+        self.urls = list(urls)
         self.parser = parser or self._default_parser
         self.storage = storage or AggregatedStorage()
-        self.max_workers = max_workers
-        self.use_proxy = use_proxy
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.show_progress = show_progress
-        self.force_refresh_proxies = force_refresh_proxies
-        self.validate_proxies = validate_proxies
-        self.auto_export_proxies = auto_export_proxies
+
+        self.max_workers = max(1, int(max_workers))
+        self.use_proxy = bool(use_proxy)
+        self.timeout = int(timeout)
+        self.max_retries = max(1, int(max_retries))
+        self.retry_delay = float(retry_delay)
+        self.show_progress = bool(show_progress)
+        self.force_refresh_proxies = bool(force_refresh_proxies)
+        self.validate_proxies = bool(validate_proxies)
+        self.auto_export_proxies = bool(auto_export_proxies)
         self.export_proxies_file = export_proxies_file
-        
-        # Proxy manager
-        self.proxy_manager = ProxyManager(custom_sources=proxy_sources) if use_proxy else None
-        
-        # Statistics
-        self.stats = {
-            'total': len(urls),
-            'success': 0,
-            'failed': 0,
-            'start_time': None,
-            'end_time': None
+
+        self.follow_redirects = bool(follow_redirects)
+        self.max_redirects = int(max_redirects)
+        self.verify_ssl = bool(verify_ssl)
+        self.limit_per_host = int(limit_per_host)
+        self.parser_in_thread = bool(parser_in_thread)
+
+        self.retry_backoff = float(retry_backoff)
+        self.retry_jitter = float(retry_jitter)
+        self.retry_on_statuses = set(retry_on_statuses) if retry_on_statuses else {429, 500, 502, 503, 504}
+
+        self.proxy_test_url = proxy_test_url
+        self.proxy_test_timeout = int(proxy_test_timeout)
+        self.proxy_test_max_concurrent = int(proxy_test_max_concurrent)
+
+        self.headers = build_headers(headers, user_agent=user_agent)
+        self._timeout = aiohttp.ClientTimeout(total=self.timeout)
+        self._ssl = None if self.verify_ssl else False
+
+        self.proxy_manager = (
+            ProxyManager(custom_sources=proxy_sources, headers=self.headers, verify_ssl=self.verify_ssl)
+            if self.use_proxy
+            else None
+        )
+
+        # SOCKS requests require a dedicated session per proxy, so keep a small LRU.
+        self._socks_pool = SocksSessionPool(
+            max_sessions=max_socks_sessions,
+            timeout=self._timeout,
+            headers=self.headers,
+            connector_kwargs={"limit": self.max_workers, "limit_per_host": self.limit_per_host},
+        )
+        self._cache_socks_sessions = max_socks_sessions != 0
+
+        self.stats: dict[str, Any] = {
+            "total": len(self.urls),
+            "success": 0,
+            "failed": 0,
+            "start_time": None,
+            "end_time": None,
         }
-        
-    def _default_parser(self, url: str, html_content: str) -> dict:
-        """Parser mặc định - trích xuất text và links"""
-        soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # Lấy title
+
+    def _default_parser(self, url: str, html_content: str) -> dict[str, Any]:
+        soup = BeautifulSoup(html_content, "html.parser")
+
         title = soup.title.string if soup.title else ""
-        
-        # Lấy text content
+
         for script in soup(["script", "style"]):
             script.decompose()
+
         text = soup.get_text()
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = ' '.join(chunk for chunk in chunks if chunk)
-        
-        # Lấy links
-        links = [a.get('href') for a in soup.find_all('a', href=True)]
-        
+        text = " ".join(chunk for chunk in chunks if chunk)
+
+        links = [a.get("href") for a in soup.find_all("a", href=True)]
+
         return {
-            'title': title,
-            'text': text[:500],  # Giới hạn text
-            'links_count': len(links),
-            'links': links[:10]  # Lấy 10 links đầu tiên
+            "title": title,
+            "text": text[:500],
+            "links_count": len(links),
+            "links": links[:10],
         }
-    
-    async def _fetch_url(
+
+    def _retry_sleep_seconds(self, attempt: int) -> float:
+        base = float(self.retry_delay) * (float(self.retry_backoff) ** attempt)
+        if self.retry_jitter <= 0:
+            return base
+        return base + random.uniform(0.0, float(self.retry_jitter) * base)
+
+    async def _handle_bad_status(
         self,
-        session: aiohttp.ClientSession,
         url: str,
-        semaphore: asyncio.Semaphore
-    ) -> tuple[str, Optional[str]]:
-        """Fetch một URL với retry và proxy support"""
-        async with semaphore:
-            for attempt in range(self.max_retries):
-                proxy = None
-                if self.use_proxy and self.proxy_manager:
-                    proxy = await self.proxy_manager.get_proxy()
-                
+        status: int,
+        response: aiohttp.ClientResponse,
+        proxy: Optional[str],
+        attempt: int,
+    ) -> None:
+        # Strong proxy-failure signals.
+        if proxy and self.proxy_manager and status in {407, 502, 503, 504}:
+            self.proxy_manager.mark_failed(proxy)
+            if is_socks_proxy(proxy):
+                await self._socks_pool.invalidate(proxy)
+
+        # Honor Retry-After for 429 when present.
+        if status in self.retry_on_statuses and attempt < self.max_retries - 1:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
                 try:
-                    if proxy and proxy.startswith("socks"):
-                        connector = ProxyConnector.from_url(proxy)
-                        async with aiohttp.ClientSession(connector=connector) as proxy_session:
-                            async with proxy_session.get(
-                                url,
-                                timeout=aiohttp.ClientTimeout(total=self.timeout),
-                                ssl=False
-                            ) as response:
-                                if response.status == 200:
-                                    html = await response.text()
-                                    logger.info(f"✓ Successfully fetched: {url} via {proxy}")
-                                    return url, html
-                                else:
-                                    logger.warning(f"HTTP {response.status} for {url} via {proxy}")
-                    else:
-                        async with session.get(
+                    seconds = max(0.0, float(retry_after))
+                except ValueError:
+                    seconds = 0.0
+                if seconds > 0:
+                    await asyncio.sleep(seconds)
+                    return
+
+        logger.debug("HTTP %s for %s (proxy=%s)", status, url, proxy)
+
+    async def _fetch_url(self, session: aiohttp.ClientSession, url: str) -> tuple[str, Optional[str]]:
+        for attempt in range(self.max_retries):
+            proxy: Optional[str] = None
+            if self.use_proxy and self.proxy_manager:
+                proxy = await self.proxy_manager.get_proxy()
+
+            try:
+                if proxy and is_socks_proxy(proxy):
+                    socks_session = await self._socks_pool.get(proxy)
+                    try:
+                        async with socks_session.get(
                             url,
-                            proxy=proxy,
-                            timeout=aiohttp.ClientTimeout(total=self.timeout),
-                            ssl=False
+                            ssl=self._ssl,
+                            allow_redirects=self.follow_redirects,
+                            max_redirects=self.max_redirects,
                         ) as response:
                             if response.status == 200:
-                                html = await response.text()
-                                logger.info(f"✓ Successfully fetched: {url}")
-                                return url, html
-                            else:
-                                logger.warning(f"HTTP {response.status} for {url}")
-                            
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1}/{self.max_retries} failed for {url}: {e}")
-                    
-                    # Mark proxy as failed
-                    if proxy and self.proxy_manager:
-                        self.proxy_manager.mark_failed(proxy)
-                    
-                    # Retry delay
-                    if attempt < self.max_retries - 1:
-                        await asyncio.sleep(self.retry_delay)
-            
-            logger.error(f"✗ Failed to fetch after {self.max_retries} attempts: {url}")
-            return url, None
-    
-    async def _process_url(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        semaphore: asyncio.Semaphore
-    ) -> None:
-        """Process một URL: fetch + parse + save"""
-        url, html = await self._fetch_url(session, url, semaphore)
-        
-        if html:
-            try:
-                # Parse HTML
-                data = self.parser(url, html)
-                
-                # Save to storage
-                await self.storage.save(url, data)
-                
-                self.stats['success'] += 1
-            except Exception as e:
-                logger.error(f"Error processing {url}: {e}")
-                self.stats['failed'] += 1
-        else:
-            self.stats['failed'] += 1
-    
-    async def _crawl_async(self,) -> None:
-        """Main async crawl logic"""
-        # Fetch proxies nếu cần
-        if self.use_proxy and self.proxy_manager:
-            # fetch proxies from online sources
-            if self.force_refresh_proxies or len(self.proxy_manager.proxies) == 0:
-                await self.proxy_manager.fetch_proxies()
-            # validate proxies before use if any
-            if self.validate_proxies:
-                # Test all với progress bar
-                proxy_results = await self.proxy_manager.test_all_proxies(
-                    timeout=10,              # Timeout cho mỗi test
-                    max_concurrent=20,       # Test 20 proxies cùng lúc
-                    show_progress=True,      # Hiện progress bar
-                    remove_failed=True       # Tự động xóa proxy failed
-                )
-                
-                if self.auto_export_proxies:
-                    self.proxy_manager.export_live_proxies(self.export_proxies_file)
-                    logger.info(f"Auto-exported working proxies to {self.export_proxies_file}")
-                
-                print(f"\n📊 Results:")
-                print(f"Working: {proxy_results['working']}/{proxy_results['total']}")
-                print(f"Success rate: {proxy_results['success_rate']:.1%}")
-            if not self.proxy_manager.proxies:
-                logger.warning("No proxies available, continuing without proxy...")
-                self.use_proxy = False
-        
-        # Semaphore để limit concurrent requests
-        semaphore = asyncio.Semaphore(self.max_workers)
-        
-        # Custom connector với connection pooling
-        connector = aiohttp.TCPConnector(limit=self.max_workers, limit_per_host=5)
-        
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [
-                self._process_url(session, url, semaphore)
-                for url in self.urls
-            ]
-            
-            # Sử dụng tqdm progress bar nếu enabled
-            if self.show_progress:
-                await async_tqdm.gather(
-                    *tasks,
-                    desc="Crawling URLs",
-                    total=len(tasks),
-                    unit="url"
-                )
-            else:
-                await asyncio.gather(*tasks)
+                                return url, await response.text(errors="ignore")
+                            await self._handle_bad_status(url, response.status, response, proxy, attempt)
+                    finally:
+                        if not self._cache_socks_sessions:
+                            await socks_session.close()
+                else:
+                    async with session.get(
+                        url,
+                        proxy=proxy,
+                        ssl=self._ssl,
+                        allow_redirects=self.follow_redirects,
+                        max_redirects=self.max_redirects,
+                    ) as response:
+                        if response.status == 200:
+                            return url, await response.text(errors="ignore")
+                        await self._handle_bad_status(url, response.status, response, proxy, attempt)
 
-    async def _run(self):
-        await self._crawl_async()
-        await self.storage.finalize()
-    
-    def crawl(self) -> dict:
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.debug("Attempt %s/%s failed for %s: %s", attempt + 1, self.max_retries, url, e)
+                if proxy and self.proxy_manager:
+                    self.proxy_manager.mark_failed(proxy)
+                if proxy and is_socks_proxy(proxy):
+                    await self._socks_pool.invalidate(proxy)
+
+            if attempt < self.max_retries - 1:
+                await asyncio.sleep(self._retry_sleep_seconds(attempt))
+
+        logger.info("Failed to fetch after %s attempts: %s", self.max_retries, url)
+        return url, None
+
+    async def _process_url(self, session: aiohttp.ClientSession, url: str) -> None:
+        url, html = await self._fetch_url(session, url)
+        if not html:
+            self.stats["failed"] += 1
+            return
+
+        try:
+            if self.parser_in_thread and not inspect.iscoroutinefunction(self.parser):
+                data = await asyncio.to_thread(self.parser, url, html)
+            else:
+                data = self.parser(url, html)
+                if inspect.isawaitable(data):
+                    data = await data
+
+            await self.storage.save(url, data)
+            self.stats["success"] += 1
+        except Exception as e:
+            logger.exception("Error processing %s: %s", url, e)
+            self.stats["failed"] += 1
+
+    async def _maybe_prepare_proxies(self) -> None:
+        if not (self.use_proxy and self.proxy_manager):
+            return
+
+        if self.force_refresh_proxies or not self.proxy_manager.proxies:
+            await self.proxy_manager.fetch_proxies()
+
+        if self.validate_proxies and self.proxy_manager.proxies:
+            results = await self.proxy_manager.test_all_proxies(
+                test_url=self.proxy_test_url,
+                timeout=self.proxy_test_timeout,
+                max_concurrent=self.proxy_test_max_concurrent,
+                show_progress=self.show_progress,
+                remove_failed=True,
+            )
+
+            if self.auto_export_proxies:
+                self.proxy_manager.export_live_proxies(self.export_proxies_file)
+                logger.info("Auto-exported working proxies to %s", self.export_proxies_file)
+
+            logger.info(
+                "Proxy validation: working=%s/%s (success_rate=%.1f%%)",
+                results["working"],
+                results["total"],
+                results["success_rate"] * 100.0,
+            )
+
+        if not self.proxy_manager.proxies:
+            logger.warning("No proxies available; continuing without proxy.")
+            self.use_proxy = False
+
+    async def _crawl_async(self) -> None:
+        if not self.urls:
+            logger.warning("No URLs to crawl.")
+            return
+
+        await self._maybe_prepare_proxies()
+
+        connector = aiohttp.TCPConnector(limit=self.max_workers, limit_per_host=self.limit_per_host)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=self._timeout, headers=self.headers) as session:
+            worker_count = min(self.max_workers, len(self.urls))
+
+            queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+            for url in self.urls:
+                queue.put_nowait(url)
+            for _ in range(worker_count):
+                queue.put_nowait(None)
+
+            pbar = tqdm(total=len(self.urls), desc="Crawling URLs", unit="url") if self.show_progress else None
+
+            async def worker() -> None:
+                while True:
+                    url = await queue.get()
+                    try:
+                        if url is None:
+                            return
+                        await self._process_url(session, url)
+                    finally:
+                        queue.task_done()
+                        if pbar is not None and url is not None:
+                            pbar.update(1)
+
+            try:
+                tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
+                await queue.join()
+                await asyncio.gather(*tasks)
+            finally:
+                if pbar is not None:
+                    pbar.close()
+
+    async def crawl_async(self) -> dict[str, Any]:
         """
-        Bắt đầu crawl
-        
-        Returns:
-            dict: Statistics về quá trình crawl
+        Run the crawler asynchronously.
+
+        Returns a statistics dict.
         """
-        logger.info(f"Starting crawl of {len(self.urls)} URLs with {self.max_workers} workers...")
-        
-        self.stats['start_time'] = time.time()
-        
-        # # Run async crawl
-        # asyncio.run(self._crawl_async())
-        
-        # # Finalize storage
-        # asyncio.run(self.storage.finalize())
-        asyncio.run(self._run())
-        
-        self.stats['end_time'] = time.time()
-        self.stats['duration'] = round(self.stats['end_time'] - self.stats['start_time'], 2)
-        
-        logger.info(f"Crawl completed: {self.stats['success']} success, {self.stats['failed']} failed")
-        logger.info(f"Duration: {self.stats['duration']}s")
-        
+        self.stats = {
+            "total": len(self.urls),
+            "success": 0,
+            "failed": 0,
+            "start_time": None,
+            "end_time": None,
+        }
+
+        logger.info("Starting crawl of %s URLs with %s workers...", len(self.urls), self.max_workers)
+        self.stats["start_time"] = time.time()
+
+        try:
+            await self._crawl_async()
+            await self.storage.finalize()
+        finally:
+            await self._socks_pool.close()
+
+        self.stats["end_time"] = time.time()
+        self.stats["duration"] = round(self.stats["end_time"] - self.stats["start_time"], 2)
+
+        logger.info("Crawl completed: %s success, %s failed", self.stats["success"], self.stats["failed"])
+        logger.info("Duration: %ss", self.stats["duration"])
         return self.stats
-    
-    def add_urls(self, urls: List[str]) -> None:
-        """Thêm URLs vào danh sách crawl"""
+
+    def crawl(self) -> dict[str, Any]:
+        """
+        Sync wrapper for crawl_async().
+
+        If you're calling from a context that already has an event loop running
+        (Jupyter, FastAPI, etc.), use: `await crawler.crawl_async()`.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.crawl_async())
+        raise RuntimeError("WebCrawler.crawl() cannot run inside an existing event loop. Use await crawl_async().")
+
+    def add_urls(self, urls: list[str]) -> None:
         self.urls.extend(urls)
-        self.stats['total'] = len(self.urls)
-        logger.info(f"Added {len(urls)} URLs, total: {len(self.urls)}")
+        self.stats["total"] = len(self.urls)
+        logger.info("Added %s URLs, total: %s", len(urls), len(self.urls))

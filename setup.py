@@ -1,8 +1,8 @@
 """
-Setup script for web_crawler package
+Setup script for the web_crawler package.
 """
 
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -12,10 +12,10 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="web-crawler",
-    version="1.0.0",
+    version="1.2.0",
     author="Your Name",
     author_email="your.email@example.com",
-    description="Async web crawler với proxy rotation và customizable parser",
+    description="Async web crawler with proxy rotation and pluggable storage backends",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/web-crawler",
@@ -23,15 +23,10 @@ setup(
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
-        "Topic :: Software Development :: Libraries :: Python Modules",
-        "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+        "Topic :: Internet :: WWW/HTTP",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3 :: Only",
     ],
     python_requires=">=3.8",
     install_requires=requirements,
