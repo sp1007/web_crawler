@@ -34,7 +34,11 @@ class WebCrawler:
         timeout: int = 30,
         max_retries: int = 3,
         retry_delay: int = 2,
-        show_progress: bool = True
+        show_progress: bool = True,
+        force_refresh_proxies: bool = False,
+        validate_proxies: bool = True,
+        auto_export_proxies: bool = False,
+        export_proxies_file: str = "working_proxies.txt"
     ):
         """
         Args:
@@ -48,6 +52,10 @@ class WebCrawler:
             max_retries: Số lần retry khi thất bại
             retry_delay: Delay giữa các retry (seconds)
             show_progress: Hiển thị progress bar (mặc định: True)
+            force_refresh_proxies: Bắt buộc tải lại proxy từ nguồn online
+            validate_proxies: Kiểm tra proxy trước khi sử dụng
+            auto_export_proxies: Tự động xuất proxy hoạt động sau khi kiểm tra
+            export_proxies_file: File để xuất proxy hoạt động
         """
         self.urls = urls
         self.parser = parser or self._default_parser
@@ -58,6 +66,10 @@ class WebCrawler:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.show_progress = show_progress
+        self.force_refresh_proxies = force_refresh_proxies
+        self.validate_proxies = validate_proxies
+        self.auto_export_proxies = auto_export_proxies
+        self.export_proxies_file = export_proxies_file
         
         # Proxy manager
         self.proxy_manager = ProxyManager(custom_sources=proxy_sources) if use_proxy else None
@@ -176,11 +188,30 @@ class WebCrawler:
         else:
             self.stats['failed'] += 1
     
-    async def _crawl_async(self) -> None:
+    async def _crawl_async(self,) -> None:
         """Main async crawl logic"""
         # Fetch proxies nếu cần
         if self.use_proxy and self.proxy_manager:
-            await self.proxy_manager.fetch_proxies()
+            # fetch proxies from online sources
+            if self.force_refresh_proxies or len(self.proxy_manager.proxies) == 0:
+                await self.proxy_manager.fetch_proxies()
+            # validate proxies before use if any
+            if self.validate_proxies:
+                # Test all với progress bar
+                proxy_results = await self.proxy_manager.test_all_proxies(
+                    timeout=10,              # Timeout cho mỗi test
+                    max_concurrent=20,       # Test 20 proxies cùng lúc
+                    show_progress=True,      # Hiện progress bar
+                    remove_failed=True       # Tự động xóa proxy failed
+                )
+                
+                if self.auto_export_proxies:
+                    self.proxy_manager.export_live_proxies(self.export_proxies_file)
+                    logger.info(f"Auto-exported working proxies to {self.export_proxies_file}")
+                
+                print(f"\n📊 Results:")
+                print(f"Working: {proxy_results['working']}/{proxy_results['total']}")
+                print(f"Success rate: {proxy_results['success_rate']:.1%}")
             if not self.proxy_manager.proxies:
                 logger.warning("No proxies available, continuing without proxy...")
                 self.use_proxy = False

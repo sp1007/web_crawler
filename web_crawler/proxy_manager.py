@@ -2,13 +2,15 @@
 Proxy Manager - Tự động lấy và quản lý danh sách proxy
 """
 
+import os
 import aiohttp
 import asyncio
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 import random
 import logging
+from tqdm.asyncio import tqdm as async_tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -199,3 +201,151 @@ class ProxyManager:
         if source not in self.sources:
             self.sources.append(source)
             logger.info(f"Added new proxy source: {source}")
+            
+    async def test_proxy(
+        self,
+        proxy: str,
+        test_url: str = "http://httpbin.org/ip",
+        timeout: int = 10
+    ) -> Tuple[str, bool, Optional[str]]:
+        """
+        Test một proxy
+        
+        Args:
+            proxy: Proxy URL
+            test_url: URL để test (default: httpbin.org/ip)
+            timeout: Timeout (seconds)
+            
+        Returns:
+            Tuple (proxy, success, response_time/error)
+        """
+        try:
+            import time
+            start_time = time.time()
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    test_url,
+                    proxy=proxy,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    ssl=False
+                ) as response:
+                    if response.status == 200:
+                        response_time = time.time() - start_time
+                        logger.debug(f"✓ Proxy OK: {proxy} ({response_time:.2f}s)")
+                        return (proxy, True, f"{response_time:.2f}s")
+                    else:
+                        logger.debug(f"✗ Proxy failed: {proxy} (HTTP {response.status})")
+                        return (proxy, False, f"HTTP {response.status}")
+        except asyncio.TimeoutError:
+            logger.debug(f"✗ Proxy timeout: {proxy}")
+            return (proxy, False, "Timeout")
+        except Exception as e:
+            logger.debug(f"✗ Proxy error: {proxy} - {str(e)[:50]}")
+            return (proxy, False, str(e)[:50])
+        
+    async def test_all_proxies(
+        self,
+        test_url: str = "http://httpbin.org/ip",
+        timeout: int = 10,
+        max_concurrent: int = 20,
+        show_progress: bool = True,
+        remove_failed: bool = True
+    ) -> Dict[str, any]:
+        """
+        Test tất cả proxies
+        
+        Args:
+            test_url: URL để test
+            timeout: Timeout cho mỗi test
+            max_concurrent: Số proxies test đồng thời
+            show_progress: Hiển thị progress bar
+            remove_failed: Tự động xóa proxy failed
+            
+        Returns:
+            Dict với kết quả test
+        """
+        if not self.proxies:
+            logger.warning("No proxies to test")
+            return {
+                'total': 0,
+                'working': 0,
+                'failed': 0,
+                'working_proxies': [],
+                'failed_proxies': []
+            }
+        
+        logger.info(f"Testing {len(self.proxies)} proxies...")
+        
+        # Create semaphore để limit concurrent tests
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        async def test_with_semaphore(proxy):
+            async with semaphore:
+                return await self.test_proxy(proxy, test_url, timeout)
+        
+        # Test all proxies
+        tasks = [test_with_semaphore(proxy) for proxy in self.proxies]
+        
+        if show_progress:
+            results = await async_tqdm.gather(
+                *tasks,
+                desc="Testing proxies",
+                unit="proxy"
+            )
+        else:
+            results = await asyncio.gather(*tasks)
+        
+        # Analyze results
+        working_proxies = []
+        failed_proxies = []
+        
+        for proxy, success, info in results:
+            if success:
+                working_proxies.append({'proxy': proxy, 'response_time': info})
+            else:
+                failed_proxies.append({'proxy': proxy, 'error': info})
+                if remove_failed:
+                    self.mark_failed(proxy)
+        
+        # Update proxy list if needed
+        if remove_failed:
+            self.proxies = [p for p in self.proxies if p not in self.failed_proxies]
+            logger.info(f"Removed {len(failed_proxies)} failed proxies")
+        
+        stats = {
+            'total': len(results),
+            'working': len(working_proxies),
+            'failed': len(failed_proxies),
+            'success_rate': len(working_proxies) / len(results) if results else 0,
+            'working_proxies': working_proxies,
+            'failed_proxies': failed_proxies
+        }
+        
+        logger.info(f"Test completed: {stats['working']}/{stats['total']} working ({stats['success_rate']:.1%})")
+        
+        return stats
+    
+    def get_working_proxies(self) -> List[str]:
+        """Lấy danh sách proxy đang hoạt động"""
+        return [p for p in self.proxies if p not in self.failed_proxies]
+    
+    def export_live_proxies(self, filepath: str) -> None:
+        """Xuất danh sách proxy hoạt động ra file"""
+        working_proxies = self.get_working_proxies()
+        with open(filepath, 'w', encoding='utf-8') as f:
+            for proxy in working_proxies:
+                f.write(f"{proxy}\n")
+        logger.info(f"Exported {len(working_proxies)} working proxies to {filepath}")
+        
+    def import_proxies(self, filepath: str) -> None:
+        """Nhập danh sách proxy từ file"""
+        try:
+            if os.path.isfile(filepath):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    imported_proxies = [line.strip() for line in lines if line.strip()]
+                    self.add_proxies(imported_proxies)
+                logger.info(f"Imported {len(imported_proxies)} proxies from {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to import proxies from {filepath}: {e}")
