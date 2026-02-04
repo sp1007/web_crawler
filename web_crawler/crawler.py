@@ -92,7 +92,12 @@ class WebCrawler:
         self.proxy_test_max_concurrent = int(proxy_test_max_concurrent)
 
         self.headers = build_headers(headers, user_agent=user_agent)
-        self._timeout = aiohttp.ClientTimeout(total=self.timeout)
+        self._timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=self.timeout,
+            sock_connect=self.timeout,
+            sock_read=self.timeout,
+        )
         self._ssl = None if self.verify_ssl else False
 
         self.proxy_manager = (
@@ -150,7 +155,7 @@ class WebCrawler:
         self,
         url: str,
         status: int,
-        response: aiohttp.ClientResponse,
+        headers: "aiohttp.typedefs.LooseHeaders",
         proxy: Optional[str],
         attempt: int,
     ) -> None:
@@ -162,7 +167,7 @@ class WebCrawler:
 
         # Honor Retry-After for 429 when present.
         if status in self.retry_on_statuses and attempt < self.max_retries - 1:
-            retry_after = response.headers.get("Retry-After")
+            retry_after = headers.get("Retry-After")
             if retry_after:
                 try:
                     seconds = max(0.0, float(retry_after))
@@ -181,22 +186,25 @@ class WebCrawler:
                 proxy = await self.proxy_manager.get_proxy()
 
             try:
-                if proxy and is_socks_proxy(proxy):
-                    socks_session = await self._socks_pool.get(proxy)
-                    try:
-                        async with socks_session.get(
-                            url,
-                            ssl=self._ssl,
-                            allow_redirects=self.follow_redirects,
-                            max_redirects=self.max_redirects,
-                        ) as response:
-                            if response.status == 200:
-                                return url, await response.text(errors="ignore")
-                            await self._handle_bad_status(url, response.status, response, proxy, attempt)
-                    finally:
-                        if not self._cache_socks_sessions:
-                            await socks_session.close()
-                else:
+                async def _request_once() -> tuple[int, Optional[str], "aiohttp.typedefs.LooseHeaders"]:
+                    if proxy and is_socks_proxy(proxy):
+                        socks_session = await self._socks_pool.get(proxy)
+                        try:
+                            async with socks_session.get(
+                                url,
+                                ssl=self._ssl,
+                                allow_redirects=self.follow_redirects,
+                                max_redirects=self.max_redirects,
+                            ) as response:
+                                status = response.status
+                                headers = response.headers
+                                if status == 200:
+                                    return status, await response.text(errors="ignore"), headers
+                                return status, None, headers
+                        finally:
+                            if not self._cache_socks_sessions:
+                                await socks_session.close()
+
                     async with session.get(
                         url,
                         proxy=proxy,
@@ -204,9 +212,16 @@ class WebCrawler:
                         allow_redirects=self.follow_redirects,
                         max_redirects=self.max_redirects,
                     ) as response:
-                        if response.status == 200:
-                            return url, await response.text(errors="ignore")
-                        await self._handle_bad_status(url, response.status, response, proxy, attempt)
+                        status = response.status
+                        headers = response.headers
+                        if status == 200:
+                            return status, await response.text(errors="ignore"), headers
+                        return status, None, headers
+
+                status, html, headers = await asyncio.wait_for(_request_once(), timeout=self.timeout)
+                if html is not None:
+                    return url, html
+                await self._handle_bad_status(url, status, headers, proxy, attempt)
 
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 logger.debug("Attempt %s/%s failed for %s: %s", attempt + 1, self.max_retries, url, e)

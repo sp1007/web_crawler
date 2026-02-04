@@ -61,7 +61,7 @@ class ProxyManager:
     async def fetch_proxies(self) -> None:
         logger.info("Fetching proxies from %s sources...", len(self.sources))
 
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=15, connect=15, sock_connect=15, sock_read=15)
         async with aiohttp.ClientSession(timeout=timeout, headers=self.headers) as session:
             tasks = [self._fetch_from_source(session, source) for source in self.sources]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -239,28 +239,43 @@ class ProxyManager:
 
         start = time.perf_counter()
         try:
-            if is_socks_proxy(proxy):
-                connector = ProxyConnector.from_url(proxy)
-                client_timeout = aiohttp.ClientTimeout(total=timeout)
-                async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, headers=self.headers) as s:
-                    async with s.get(test_url, ssl=ssl) as response:
-                        if response.status == 200:
-                            return proxy, True, f"{time.perf_counter() - start:.2f}s"
-                        return proxy, False, f"HTTP {response.status}"
+            async def _request_with_session(
+                http_session: aiohttp.ClientSession, proxy_arg: Optional[str]
+            ) -> tuple[bool, str]:
+                async with http_session.get(test_url, proxy=proxy_arg, ssl=ssl) as response:
+                    if response.status == 200:
+                        return True, f"{time.perf_counter() - start:.2f}s"
+                    return False, f"HTTP {response.status}"
 
-            # HTTP(S) proxy path
-            if session is None:
-                client_timeout = aiohttp.ClientTimeout(total=timeout)
-                async with aiohttp.ClientSession(timeout=client_timeout, headers=self.headers) as s:
-                    async with s.get(test_url, proxy=proxy, ssl=ssl) as response:
-                        if response.status == 200:
-                            return proxy, True, f"{time.perf_counter() - start:.2f}s"
-                        return proxy, False, f"HTTP {response.status}"
+            async def _request_once() -> tuple[bool, str]:
+                if is_socks_proxy(proxy):
+                    connector = ProxyConnector.from_url(proxy)
+                    client_timeout = aiohttp.ClientTimeout(
+                        total=timeout,
+                        connect=timeout,
+                        sock_connect=timeout,
+                        sock_read=timeout,
+                    )
+                    async with aiohttp.ClientSession(
+                        connector=connector, timeout=client_timeout, headers=self.headers
+                    ) as s:
+                        return await _request_with_session(s, None)
 
-            async with session.get(test_url, proxy=proxy, ssl=ssl) as response:
-                if response.status == 200:
-                    return proxy, True, f"{time.perf_counter() - start:.2f}s"
-                return proxy, False, f"HTTP {response.status}"
+                # HTTP(S) proxy path
+                if session is None:
+                    client_timeout = aiohttp.ClientTimeout(
+                        total=timeout,
+                        connect=timeout,
+                        sock_connect=timeout,
+                        sock_read=timeout,
+                    )
+                    async with aiohttp.ClientSession(timeout=client_timeout, headers=self.headers) as s:
+                        return await _request_with_session(s, proxy)
+
+                return await _request_with_session(session, proxy)
+
+            success, info = await asyncio.wait_for(_request_once(), timeout=timeout)
+            return proxy, success, info
 
         except asyncio.TimeoutError:
             return proxy, False, "Timeout"
@@ -290,7 +305,12 @@ class ProxyManager:
             }
 
         semaphore = asyncio.Semaphore(max(1, int(max_concurrent)))
-        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        client_timeout = aiohttp.ClientTimeout(
+            total=timeout,
+            connect=timeout,
+            sock_connect=timeout,
+            sock_read=timeout,
+        )
 
         async def test_with_semaphore(proxy: str, http_session: aiohttp.ClientSession) -> tuple[str, bool, str]:
             async with semaphore:
